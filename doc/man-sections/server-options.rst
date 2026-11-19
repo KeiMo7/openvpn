@@ -231,6 +231,12 @@ fast hardware. SSL/TLS authentication must be used in this mode.
   connect. In the absence of this option, OpenVPN will disconnect a client
   instance upon connection of a new client having the same common name.
 
+  When concurrent sessions are allowed, every session is assigned its own
+  virtual address and route.  The server never places two active sessions on
+  the same address.  Without this option there is only one active session per
+  common name; a reconnecting client can reuse the retained address of the
+  replaced session.
+
 --ifconfig-pool args
   Set aside a pool of subnets to be dynamically allocated to connecting
   clients, similar to a DHCP server.
@@ -283,6 +289,35 @@ fast hardware. SSL/TLS authentication must be used in this mode.
   IP address.  They do not guarantee that the given common name will always
   receive the given IP address. If you want guaranteed assignment, use
   ``--ifconfig-push``
+
+--ifconfig-pool-retain seconds
+  Keep a dynamically assigned virtual address reserved for a disconnected
+  client for ``seconds`` seconds.  If that client reconnects within the
+  retention window, it receives the same IPv4 and IPv6 pool address.
+
+  The default is :code:`0`, which preserves the traditional immediate-release
+  behaviour.  Retained addresses count against the pool size.  To avoid
+  exhausting the pool, OpenVPN keeps a low-water reserve of roughly 10 percent
+  of the pool: as free capacity drops, the effective retention time is reduced
+  proportionally.  If no free address remains, the retained address that has
+  been idle for the longest time is reclaimed.  IP addresses can therefore
+  still change under severe pool pressure.
+
+  With :code:`--duplicate-cn`, concurrent sessions using the same certificate
+  are assigned distinct addresses.  Without :code:`--duplicate-cn`, a new
+  connection replaces the previous session for that common name and can reuse
+  its retained address.
+
+  Management commands that kill an active client release its address
+  immediately instead of retaining it.  ``kill cn`` also releases a retained
+  address for that common name.  The status file reports assigned, retained and
+  free counts, retained expiry and reconnect counts.
+
+  While the server still has the tunnel instance, the existing TLS session ID
+  lookup reuses that control session and does not run a new address allocation.
+  The retention timer applies after the old instance has been closed; this
+  keeps reconnect addressing stable without changing the TLS handshake or data
+  channel session logic.
 
 --ifconfig-push args
   Push virtual IP endpoints for client tunnel, overriding the

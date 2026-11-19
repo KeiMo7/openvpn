@@ -121,6 +121,9 @@ struct multi_instance
     struct mroute_addr real; /**< External network address of the
                               *   remote peer. */
     ifconfig_pool_handle vaddr_handle;
+    bool vaddr_release_immediately; /**< Management initiated the disconnect. */
+    bool vaddr_reused;              /**< Reused the address from an earlier lease. */
+    uint64_t vaddr_reconnect_count; /**< Number of reconnects seen for this client. */
     char msg_prefix[MULTI_PREFIX_MAX_LENGTH];
 
     /* queued outgoing data in Server/TCP mode */
@@ -202,6 +205,7 @@ struct multi_context
     int tcp_queue_limit;
     int status_file_version;
     int n_clients; /* current number of authenticated clients */
+    uint64_t virtual_addr_conflicts;
 
 #ifdef ENABLE_MANAGEMENT
     struct hash *cid_hash;

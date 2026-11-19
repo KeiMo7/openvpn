@@ -214,6 +214,11 @@ Command examples:
 
 Use the "status" command to see which clients are connected.
 
+If --ifconfig-pool-retain is enabled, kill also releases a retained virtual
+address belonging to the common name immediately.  Kill by address or CID
+marks the active session for immediate address release instead of starting a
+new retention period.
+
 COMMAND -- log
 --------------
 
@@ -939,6 +944,8 @@ COMMAND -- client-kill  (OpenVPN 2.1 or higher)
 -----------------------------------------------
 
 Immediately kill a client instance by CID.
+If --ifconfig-pool-retain is enabled, its virtual address is released
+immediately rather than retained.
 
   client-kill {CID} [M]
 

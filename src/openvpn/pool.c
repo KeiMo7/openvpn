@@ -53,10 +53,13 @@ static void
 ifconfig_pool_entry_free(struct ifconfig_pool_entry *ipe, bool hard)
 {
     ipe->in_use = false;
+    ipe->retained = false;
+    ipe->retained_until = 0;
     if (hard && ipe->common_name)
     {
         free(ipe->common_name);
         ipe->common_name = NULL;
+        ipe->reconnect_count = 0;
     }
     if (hard)
     {
@@ -69,57 +72,144 @@ ifconfig_pool_entry_free(struct ifconfig_pool_entry *ipe, bool hard)
 }
 
 static int
-ifconfig_pool_find(struct ifconfig_pool *pool, const char *common_name)
+ifconfig_pool_count_free(const struct ifconfig_pool *pool)
 {
-    int i;
-    time_t earliest_release = 0;
-    int previous_usage = -1;
-    int new_usage = -1;
+    int free_count = 0;
 
-    for (i = 0; i < pool->size; ++i)
+    for (int i = 0; i < pool->size; ++i)
     {
         const struct ifconfig_pool_entry *ipe = &pool->list[i];
-        if (!ipe->in_use)
+        if (!ipe->in_use && !ipe->retained)
         {
-            /*
-             * If duplicate_cn mode, take first available IP address
-             */
-            if (pool->duplicate_cn)
-            {
-                new_usage = i;
-                break;
-            }
+            ++free_count;
+        }
+    }
+    return free_count;
+}
 
-            /*
-             * Keep track of the unused IP address entry which
-             * was released earliest.
-             */
-            if ((new_usage == -1 || ipe->last_release < earliest_release) && !ipe->fixed)
-            {
-                earliest_release = ipe->last_release;
-                new_usage = i;
-            }
+static int
+ifconfig_pool_reserve(const struct ifconfig_pool *pool)
+{
+    return max_int(1, pool->size / 10);
+}
 
-            /*
-             * Keep track of a possible allocation to us
-             * from an earlier session.
-             */
-            if (previous_usage < 0 && common_name && ipe->common_name
-                && !strcmp(common_name, ipe->common_name))
+/*
+ * Keep at least the low-water reserve available.  When the free part of the
+ * pool drops below that reserve, retained leases are shortened proportionally
+ * and are released no later than the resulting deadline.
+ */
+static int
+ifconfig_pool_effective_retain(const struct ifconfig_pool *pool, int free_count)
+{
+    const int reserve = ifconfig_pool_reserve(pool);
+    int64_t retain;
+
+    if (pool->retain_seconds <= 0)
+    {
+        return 0;
+    }
+    if (free_count >= reserve)
+    {
+        return pool->retain_seconds;
+    }
+    if (free_count <= 0)
+    {
+        return 0;
+    }
+
+    retain = (int64_t)pool->retain_seconds * free_count / reserve;
+    return max_int(1, (int)retain);
+}
+
+static void
+ifconfig_pool_expire_retained(struct ifconfig_pool *pool)
+{
+    for (int i = 0; i < pool->size; ++i)
+    {
+        struct ifconfig_pool_entry *ipe = &pool->list[i];
+        if (!ipe->retained)
+        {
+            continue;
+        }
+
+        if (ipe->retained_until <= now)
+        {
+            ifconfig_pool_entry_free(ipe, false);
+            ++pool->expired_reclaims;
+        }
+    }
+}
+
+static int
+ifconfig_pool_find(struct ifconfig_pool *pool, const char *common_name)
+{
+    int retained_usage = -1;
+    int previous_usage = -1;
+    int oldest_retained = -1;
+    int new_usage = -1;
+    time_t earliest_release = 0;
+    time_t oldest_retained_release = 0;
+
+    for (int i = 0; i < pool->size; ++i)
+    {
+        const struct ifconfig_pool_entry *ipe = &pool->list[i];
+        if (ipe->in_use)
+        {
+            continue;
+        }
+
+        if (common_name && ipe->common_name && !strcmp(common_name, ipe->common_name))
+        {
+            if (ipe->retained && retained_usage < 0)
+            {
+                retained_usage = i;
+            }
+            else if (previous_usage < 0)
             {
                 previous_usage = i;
             }
         }
+
+        if (ipe->retained)
+        {
+            if (oldest_retained < 0 || ipe->last_release < oldest_retained_release)
+            {
+                oldest_retained = i;
+                oldest_retained_release = ipe->last_release;
+            }
+        }
+        else if (!ipe->fixed
+                 && (new_usage < 0 || ipe->last_release < earliest_release))
+        {
+            earliest_release = ipe->last_release;
+            new_usage = i;
+        }
     }
 
+    if (retained_usage >= 0)
+    {
+        return retained_usage;
+    }
     if (previous_usage >= 0)
     {
         return previous_usage;
     }
-
     if (new_usage >= 0)
     {
         return new_usage;
+    }
+
+    /*
+     * The pool is exhausted.  Reclaim the retained lease that has been idle
+     * for the longest time.  This is the last-resort path and guarantees that
+     * retained sessions cannot make a pool permanently unusable.
+     */
+    if (oldest_retained >= 0)
+    {
+        pool->list[oldest_retained].retained = false;
+        pool->list[oldest_retained].retained_until = 0;
+        ++pool->lru_reclaims;
+        return oldest_retained;
     }
 
     return -1;
@@ -313,21 +403,62 @@ ifconfig_pool_free(struct ifconfig_pool *pool)
 }
 
 ifconfig_pool_handle
-ifconfig_pool_acquire(struct ifconfig_pool *pool, in_addr_t *local, in_addr_t *remote,
-                      struct in6_addr *remote_ipv6, const char *common_name)
+ifconfig_pool_acquire_ex(struct ifconfig_pool *pool, in_addr_t *local, in_addr_t *remote,
+                         struct in6_addr *remote_ipv6, const char *common_name, bool *reused,
+                         uint64_t *reconnect_count)
 {
-    int i;
+    int i = -1;
+    uint64_t previous_reconnects = 0;
 
+    if (reused)
+    {
+        *reused = false;
+    }
+    if (reconnect_count)
+    {
+        *reconnect_count = 0;
+    }
+
+    if (!pool)
+    {
+        return -1;
+    }
+
+    ifconfig_pool_expire_retained(pool);
     i = ifconfig_pool_find(pool, common_name);
+
     if (i >= 0)
     {
         struct ifconfig_pool_entry *ipe = &pool->list[i];
+        const bool same_client =
+            common_name && ipe->common_name && !strcmp(common_name, ipe->common_name);
+
         ASSERT(!ipe->in_use);
+        previous_reconnects = ipe->reconnect_count;
+        if (same_client && (ipe->last_release != 0 || ipe->reconnect_count != 0))
+        {
+            ++previous_reconnects;
+            ++pool->total_reconnects;
+        }
+        else if (!same_client)
+        {
+            previous_reconnects = 0;
+        }
+
         ifconfig_pool_entry_free(ipe, true);
         ipe->in_use = true;
+        ipe->reconnect_count = previous_reconnects;
         if (common_name)
         {
             ipe->common_name = string_alloc(common_name, NULL);
+        }
+        if (reused)
+        {
+            *reused = same_client;
+        }
+        if (reconnect_count)
+        {
+            *reconnect_count = ipe->reconnect_count;
         }
 
         if (pool->ipv4.enabled && local && remote)
@@ -353,6 +484,13 @@ ifconfig_pool_acquire(struct ifconfig_pool *pool, in_addr_t *local, in_addr_t *r
     return i;
 }
 
+ifconfig_pool_handle
+ifconfig_pool_acquire(struct ifconfig_pool *pool, in_addr_t *local, in_addr_t *remote,
+                      struct in6_addr *remote_ipv6, const char *common_name)
+{
+    return ifconfig_pool_acquire_ex(pool, local, remote, remote_ipv6, common_name, NULL, NULL);
+}
+
 bool
 ifconfig_pool_release(struct ifconfig_pool *pool, ifconfig_pool_handle hand, const bool hard)
 {
@@ -360,10 +498,186 @@ ifconfig_pool_release(struct ifconfig_pool *pool, ifconfig_pool_handle hand, con
 
     if (pool && hand >= 0 && hand < pool->size)
     {
-        ifconfig_pool_entry_free(&pool->list[hand], hard);
+        struct ifconfig_pool_entry *ipe = &pool->list[hand];
+
+        if (!hard && pool->retain_seconds > 0 && ipe->common_name)
+        {
+            const int free_count_after_release = ifconfig_pool_count_free(pool) + 1;
+
+            ipe->in_use = false;
+            ipe->retained = true;
+            ipe->last_release = now;
+            ipe->retained_until =
+                now + ifconfig_pool_effective_retain(pool, free_count_after_release);
+        }
+        else
+        {
+            ifconfig_pool_entry_free(ipe, hard);
+        }
         ret = true;
     }
     return ret;
+}
+
+void
+ifconfig_pool_set_retain(struct ifconfig_pool *pool, int retain_seconds)
+{
+    if (pool)
+    {
+        pool->retain_seconds = max_int(0, retain_seconds);
+    }
+}
+
+void
+ifconfig_pool_reap(struct ifconfig_pool *pool)
+{
+    if (pool && pool->retain_seconds > 0)
+    {
+        ifconfig_pool_expire_retained(pool);
+    }
+}
+
+int
+ifconfig_pool_release_by_cn(struct ifconfig_pool *pool, const char *common_name)
+{
+    int released = 0;
+
+    if (pool && common_name)
+    {
+        for (int i = 0; i < pool->size; ++i)
+        {
+            struct ifconfig_pool_entry *ipe = &pool->list[i];
+            if (ipe->retained && ipe->common_name && !strcmp(common_name, ipe->common_name))
+            {
+                ifconfig_pool_entry_free(ipe, true);
+                ++released;
+            }
+        }
+    }
+    return released;
+}
+
+void
+ifconfig_pool_get_stats(const struct ifconfig_pool *pool, struct ifconfig_pool_stats *stats)
+{
+    CLEAR(*stats);
+    if (!pool)
+    {
+        return;
+    }
+
+    stats->total = pool->size;
+    stats->total_reconnects = pool->total_reconnects;
+    stats->expired_reclaims = pool->expired_reclaims;
+    stats->lru_reclaims = pool->lru_reclaims;
+
+    for (int i = 0; i < pool->size; ++i)
+    {
+        const struct ifconfig_pool_entry *ipe = &pool->list[i];
+        if (ipe->in_use)
+        {
+            ++stats->assigned;
+        }
+        else if (ipe->retained)
+        {
+            ++stats->retained;
+        }
+        else
+        {
+            ++stats->free;
+        }
+    }
+}
+
+void
+ifconfig_pool_status(const struct ifconfig_pool *pool, struct status_output *out,
+                     const char sep)
+{
+    if (!pool || !out)
+    {
+        return;
+    }
+
+    struct gc_arena gc = gc_new();
+    status_printf(
+        out,
+        "HEADER%cRETAINED_CLIENT%cCommon Name%cVirtual Address%cVirtual IPv6 Address%cRetained Until%cRetained Until (time_t)%cReconnects",
+        sep, sep, sep, sep, sep, sep, sep);
+
+    for (int i = 0; i < pool->size; ++i)
+    {
+        const struct ifconfig_pool_entry *ipe = &pool->list[i];
+        if (!ipe->retained)
+        {
+            continue;
+        }
+
+        char ipv4[INET_ADDRSTRLEN] = "";
+        char ipv6[INET6_ADDRSTRLEN] = "";
+
+        if (pool->ipv4.enabled)
+        {
+            const in_addr_t addr = ifconfig_pool_handle_to_ip_base(pool, i);
+            strlcpy(ipv4, print_in_addr_t(addr, 0, &gc), sizeof(ipv4));
+        }
+        if (pool->ipv6.enabled)
+        {
+            const struct in6_addr addr = ifconfig_pool_handle_to_ipv6_base(pool, i);
+            strlcpy(ipv6, print_in6_addr(addr, 0, &gc), sizeof(ipv6));
+        }
+
+        status_printf(out, "RETAINED_CLIENT%c%s%c%s%c%s%c%s%c%u%c%llu", sep,
+                      ipe->common_name ? ipe->common_name : "", sep, ipv4, sep, ipv6, sep,
+                      time_string(ipe->retained_until, 0, false, &gc), sep,
+                      (unsigned int)ipe->retained_until, sep,
+                      (unsigned long long)ipe->reconnect_count);
+    }
+    gc_free(&gc);
+}
+
+void
+ifconfig_pool_reconnect_status(const struct ifconfig_pool *pool, struct status_output *out,
+                               const char sep)
+{
+    if (!pool || !out)
+    {
+        return;
+    }
+
+    struct gc_arena gc = gc_new();
+    status_printf(
+        out,
+        "HEADER%cCLIENT_RECONNECTS%cCommon Name%cVirtual Address%cVirtual IPv6 Address%cState%cReconnects",
+        sep, sep, sep, sep, sep, sep);
+
+    for (int i = 0; i < pool->size; ++i)
+    {
+        const struct ifconfig_pool_entry *ipe = &pool->list[i];
+        if (!ipe->common_name || ipe->reconnect_count == 0)
+        {
+            continue;
+        }
+
+        char ipv4[INET_ADDRSTRLEN] = "";
+        char ipv6[INET6_ADDRSTRLEN] = "";
+
+        if (pool->ipv4.enabled)
+        {
+            const in_addr_t addr = ifconfig_pool_handle_to_ip_base(pool, i);
+            strlcpy(ipv4, print_in_addr_t(addr, 0, &gc), sizeof(ipv4));
+        }
+        if (pool->ipv6.enabled)
+        {
+            const struct in6_addr addr = ifconfig_pool_handle_to_ipv6_base(pool, i);
+            strlcpy(ipv6, print_in6_addr(addr, 0, &gc), sizeof(ipv6));
+        }
+
+        status_printf(out, "CLIENT_RECONNECTS%c%s%c%s%c%s%c%s%c%llu", sep,
+                      ipe->common_name, sep, ipv4, sep, ipv6, sep,
+                      ipe->in_use ? "active" : "retained", sep,
+                      (unsigned long long)ipe->reconnect_count);
+    }
+    gc_free(&gc);
 }
 
 /*

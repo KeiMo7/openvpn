@@ -369,6 +369,7 @@ multi_init(struct context *t)
             t->options.ifconfig_pool_end, t->options.duplicate_cn,
             t->options.ifconfig_ipv6_pool_defined, t->options.ifconfig_ipv6_pool_base,
             t->options.ifconfig_ipv6_pool_netbits);
+        ifconfig_pool_set_retain(m->ifconfig_pool, t->options.ifconfig_pool_retain_seconds);
 
         /* reload pool data from file */
         if (t->c1.ifconfig_pool_persist)
@@ -635,7 +636,8 @@ multi_close_instance(struct multi_context *m, struct multi_instance *mi, bool sh
 
         schedule_remove_entry(m->schedule, (struct schedule_entry *)mi);
 
-        ifconfig_pool_release(m->ifconfig_pool, mi->vaddr_handle, false);
+        ifconfig_pool_release(m->ifconfig_pool, mi->vaddr_handle,
+                              mi->vaddr_release_immediately);
 
         if (mi->did_iroutes)
         {
@@ -815,8 +817,11 @@ multi_print_status(struct multi_context *m, struct status_output *so, const int 
     struct gc_arena gc_top = gc_new();
     struct hash_iterator hi;
     const struct hash_element *he;
+    struct ifconfig_pool_stats pool_stats;
 
     status_reset(so);
+    ifconfig_pool_reap(m->ifconfig_pool);
+    ifconfig_pool_get_stats(m->ifconfig_pool, &pool_stats);
 
     if (dco_enabled(&m->top.options))
     {
@@ -878,6 +883,22 @@ multi_print_status(struct multi_context *m, struct status_output *so, const int 
             gc_free(&gc);
         }
         hash_iterator_free(&hi);
+
+        if (m->ifconfig_pool)
+        {
+            status_printf(so, "IFCONFIG POOL");
+            status_printf(
+                so,
+                "Assigned,Retained,Free,Retain Seconds,Reconnects,Expired Reclaims,LRU Reclaims");
+            status_printf(so, "%d,%d,%d,%d,%llu,%llu,%llu", pool_stats.assigned,
+                          pool_stats.retained, pool_stats.free,
+                          m->top.options.ifconfig_pool_retain_seconds,
+                          (unsigned long long)pool_stats.total_reconnects,
+                          (unsigned long long)pool_stats.expired_reclaims,
+                          (unsigned long long)pool_stats.lru_reclaims);
+            ifconfig_pool_status(m->ifconfig_pool, so, ',');
+            ifconfig_pool_reconnect_status(m->ifconfig_pool, so, ',');
+        }
 
         status_printf(so, "GLOBAL STATS");
         if (m->mbuf)
@@ -969,12 +990,39 @@ multi_print_status(struct multi_context *m, struct status_output *so, const int 
         }
         hash_iterator_free(&hi);
 
+        if (m->ifconfig_pool)
+        {
+            ifconfig_pool_status(m->ifconfig_pool, so, sep);
+            ifconfig_pool_reconnect_status(m->ifconfig_pool, so, sep);
+        }
+
         if (m->mbuf)
         {
             status_printf(so, "GLOBAL_STATS%cMax bcast/mcast queue length%c%d", sep, sep,
                           mbuf_maximum_queued(m->mbuf));
         }
 
+        if (m->ifconfig_pool)
+        {
+            status_printf(so, "GLOBAL_STATS%cifconfig_pool_total%c%d", sep, sep,
+                          pool_stats.total);
+            status_printf(so, "GLOBAL_STATS%cifconfig_pool_assigned%c%d", sep, sep,
+                          pool_stats.assigned);
+            status_printf(so, "GLOBAL_STATS%cifconfig_pool_retained%c%d", sep, sep,
+                          pool_stats.retained);
+            status_printf(so, "GLOBAL_STATS%cifconfig_pool_free%c%d", sep, sep,
+                          pool_stats.free);
+            status_printf(so, "GLOBAL_STATS%cifconfig_pool_retain_seconds%c%d", sep, sep,
+                          m->top.options.ifconfig_pool_retain_seconds);
+            status_printf(so, "GLOBAL_STATS%cifconfig_pool_reconnects%c%llu", sep, sep,
+                          (unsigned long long)pool_stats.total_reconnects);
+            status_printf(so, "GLOBAL_STATS%cifconfig_pool_expired_reclaims%c%llu", sep, sep,
+                          (unsigned long long)pool_stats.expired_reclaims);
+            status_printf(so, "GLOBAL_STATS%cifconfig_pool_lru_reclaims%c%llu", sep, sep,
+                          (unsigned long long)pool_stats.lru_reclaims);
+        }
+        status_printf(so, "GLOBAL_STATS%cvirtual_address_conflicts%c%llu", sep, sep,
+                      (unsigned long long)m->virtual_addr_conflicts);
         status_printf(so, "GLOBAL_STATS%cdco_enabled%c%d", sep, sep,
                       dco_enabled(&m->top.options));
         status_printf(so, "END");
@@ -1396,7 +1444,37 @@ ifconfig_push_constraint_satisfied(const struct context *c)
  * Use an --ifconfig-push directive, if given (static IP).
  * Otherwise use an --ifconfig-pool address (dynamic IP).
  */
-static void
+static struct multi_instance *
+multi_virtual_addr_conflict(struct multi_context *m, const struct multi_instance *mi)
+{
+    for (uint32_t i = 0; i <= m->max_peerid; ++i)
+    {
+        struct multi_instance *other = m->instances[i];
+        if (!other || other == mi || other->halt)
+        {
+            continue;
+        }
+
+        if (mi->context.c2.push_ifconfig_defined
+            && other->context.c2.push_ifconfig_defined
+            && mi->context.c2.push_ifconfig_local
+                   == other->context.c2.push_ifconfig_local)
+        {
+            return other;
+        }
+
+        if (mi->context.c2.push_ifconfig_ipv6_defined
+            && other->context.c2.push_ifconfig_ipv6_defined
+            && OPENVPN_IN6_ARE_ADDR_EQUAL(&mi->context.c2.push_ifconfig_ipv6_local,
+                                          &other->context.c2.push_ifconfig_ipv6_local))
+        {
+            return other;
+        }
+    }
+    return NULL;
+}
+
+static bool
 multi_select_virtual_addr(struct multi_context *m, struct multi_instance *mi)
 {
     struct gc_arena gc = gc_new();
@@ -1436,16 +1514,12 @@ multi_select_virtual_addr(struct multi_context *m, struct multi_instance *mi)
     {
         in_addr_t local = 0, remote = 0;
         struct in6_addr remote_ipv6;
-        const char *cn = NULL;
-
-        if (!mi->context.options.duplicate_cn)
-        {
-            cn = tls_common_name(mi->context.c2.tls_multi, true);
-        }
+        const char *cn = tls_common_name(mi->context.c2.tls_multi, true);
 
         CLEAR(remote_ipv6);
-        mi->vaddr_handle =
-            ifconfig_pool_acquire(m->ifconfig_pool, &local, &remote, &remote_ipv6, cn);
+        mi->vaddr_handle = ifconfig_pool_acquire_ex(
+            m->ifconfig_pool, &local, &remote, &remote_ipv6, cn, &mi->vaddr_reused,
+            &mi->vaddr_reconnect_count);
         if (mi->vaddr_handle >= 0)
         {
             const int tunnel_type = TUNNEL_TYPE(mi->context.c1.tuntap);
@@ -1531,7 +1605,25 @@ multi_select_virtual_addr(struct multi_context *m, struct multi_instance *mi)
             mi->context.c2.push_ifconfig_ipv6_netbits);
     }
 
+    struct multi_instance *other = multi_virtual_addr_conflict(m, mi);
+    if (other)
+    {
+        ++m->virtual_addr_conflicts;
+        msg(D_MULTI_ERRORS,
+            "MULTI: virtual address conflict for %s with existing client %s; rejecting new session",
+            multi_instance_string(mi, false, &gc), multi_instance_string(other, false, &gc));
+        if (mi->vaddr_handle >= 0)
+        {
+            ifconfig_pool_release(m->ifconfig_pool, mi->vaddr_handle, true);
+            mi->vaddr_handle = -1;
+        }
+        mi->context.options.disable = true;
+        gc_free(&gc);
+        return false;
+    }
+
     gc_free(&gc);
+    return true;
 }
 
 /*
@@ -1694,6 +1786,9 @@ multi_client_connect_setenv(struct multi_instance *mi)
 
     /* setenv client virtual IP address */
     multi_set_virtual_addr_env(mi);
+    setenv_int(mi->context.c2.es, "ifconfig_pool_reused", mi->vaddr_reused);
+    setenv_counter(mi->context.c2.es, "ifconfig_pool_reconnects",
+                   mi->vaddr_reconnect_count);
 
     /* setenv connection time */
     {
@@ -2424,7 +2519,7 @@ multi_client_connect_late_setup(struct multi_context *m, struct multi_instance *
     gc_free(&gc);
 }
 
-static void
+static bool
 multi_client_connect_early_setup(struct multi_context *m, struct multi_instance *mi)
 {
     ASSERT(mi->context.c1.tuntap);
@@ -2448,9 +2543,13 @@ multi_client_connect_early_setup(struct multi_context *m, struct multi_instance 
     mi->vaddr_handle = -1;
 
     /* do --client-connect setenvs */
-    multi_select_virtual_addr(m, mi);
+    if (!multi_select_virtual_addr(m, mi))
+    {
+        return false;
+    }
 
     multi_client_connect_setenv(mi);
+    return true;
 }
 
 static bool
@@ -2682,6 +2781,7 @@ multi_connection_established(struct multi_context *m, struct multi_instance *mi)
 
     int *cur_handler_index = &mi->client_connect_defer_state.cur_handler_index;
     uint64_t *option_types_found = &mi->client_connect_defer_state.option_types_found;
+    bool early_setup_ok = true;
 
     /* We are called for the first time */
     if (!from_deferred)
@@ -2691,10 +2791,10 @@ multi_connection_established(struct multi_context *m, struct multi_instance *mi)
         /* Initially we have no handler that has returned a result */
         mi->context.c2.tls_multi->multi_state = CAS_PENDING_DEFERRED;
 
-        multi_client_connect_early_setup(m, mi);
+        early_setup_ok = multi_client_connect_early_setup(m, mi);
     }
 
-    bool cc_succeeded = true;
+    bool cc_succeeded = early_setup_ok && !mi->context.options.disable;
 
     while (cc_succeeded && client_connect_handlers[*cur_handler_index] != NULL)
     {
@@ -3829,6 +3929,10 @@ multi_process_per_second_timers_dowork(struct multi_context *m)
     /* possibly flush ifconfig-pool file */
     multi_ifconfig_pool_persist(m, false);
 
+    /* release retained addresses whose deadline has expired or was shortened
+     * by pool pressure */
+    ifconfig_pool_reap(m->ifconfig_pool);
+
 #ifdef ENABLE_DEBUG
     gremlin_flood_clients(m);
 #endif
@@ -3944,7 +4048,7 @@ static int
 management_callback_kill_by_cn(void *arg, const char *del_cn)
 {
     struct multi_context *m = (struct multi_context *)arg;
-    int count = 0;
+    int count = ifconfig_pool_release_by_cn(m->ifconfig_pool, del_cn);
 
     for (uint32_t i = 0; i <= m->max_peerid; i++)
     {
@@ -3954,6 +4058,7 @@ management_callback_kill_by_cn(void *arg, const char *del_cn)
             const char *cn = tls_common_name(mi->context.c2.tls_multi, false);
             if (cn && !strcmp(cn, del_cn))
             {
+                mi->vaddr_release_immediately = true;
                 multi_signal_instance(m, mi, SIGTERM);
                 ++count;
             }
@@ -3982,6 +4087,7 @@ management_callback_kill_by_addr(void *arg, const in_addr_t addr, const uint16_t
             struct multi_instance *mi = m->instances[i];
             if (mi && !mi->halt && mroute_addr_equal(&maddr, &mi->real))
             {
+                mi->vaddr_release_immediately = true;
                 multi_signal_instance(m, mi, SIGTERM);
                 ++count;
             }
@@ -4021,6 +4127,7 @@ management_kill_by_cid(void *arg, const unsigned long cid, const char *kill_msg)
     struct multi_instance *mi = lookup_by_cid(m, cid);
     if (mi)
     {
+        mi->vaddr_release_immediately = true;
         send_restart(&mi->context, kill_msg); /* was: multi_signal_instance (m, mi, SIGTERM); */
         multi_schedule_context_wakeup(m, mi);
         return true;

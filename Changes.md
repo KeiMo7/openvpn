@@ -2,6 +2,15 @@
 
 ## User-visible Changes
 
+* **Retained ifconfig-pool addresses**
+
+  The new `--ifconfig-pool-retain seconds` option keeps a disconnected client's
+  virtual address reserved so a short reconnect reuses the same address. The
+  default remains immediate release. Retained addresses are reduced
+  automatically under pool pressure, reclaimed least-recently-used when the
+  pool is exhausted, and exposed together with reconnect counters in status
+  output.
+
 * **Parsing Distinguished Names in certificates**
 
   (OpenSSL backend:) OpenVPN now rejects certificates that have a null-byte

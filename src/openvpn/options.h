@@ -491,6 +491,7 @@ struct options
     in_addr_t ifconfig_pool_netmask;
     const char *ifconfig_pool_persist_filename;
     int ifconfig_pool_persist_refresh_freq;
+    int ifconfig_pool_retain_seconds;
 
     bool ifconfig_ipv6_pool_defined;         /* IPv6 */
     struct in6_addr ifconfig_ipv6_pool_base; /* IPv6 */

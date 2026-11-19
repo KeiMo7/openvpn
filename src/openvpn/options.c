@@ -452,6 +452,8 @@ static const char usage_message[] =
     "--ifconfig-pool-persist file [seconds] : Persist/unpersist ifconfig-pool\n"
     "                  data to file, at seconds intervals (default=600).\n"
     "                  If seconds=0, file will be treated as read-only.\n"
+    "--ifconfig-pool-retain seconds : Keep disconnected client addresses\n"
+    "                  reserved for this many seconds (default=0).\n"
     "--ifconfig-ipv6-pool base-IP/bits : set aside an IPv6 network block\n"
     "                  to be dynamically allocated to connecting clients.\n"
     "--ifconfig-push local remote-netmask : Push an ifconfig option to remote,\n"
@@ -868,6 +870,7 @@ init_options(struct options *o)
     o->max_routes_per_client = 256;
     o->stale_routes_check_interval = 0;
     o->ifconfig_pool_persist_refresh_freq = 600;
+    o->ifconfig_pool_retain_seconds = 0;
     o->scheduled_exit_interval = 5;
     o->authname = "SHA1";
     o->replay_window = DEFAULT_SEQ_BACKTRACK;
@@ -1872,6 +1875,12 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
             msg(M_USAGE,
                 "--ifconfig-pool-persist must be used with --ifconfig-pool or --ifconfig-ipv6-pool");
         }
+        if (!options->ifconfig_pool_defined && !options->ifconfig_ipv6_pool_defined
+            && options->ifconfig_pool_retain_seconds)
+        {
+            msg(M_USAGE,
+                "--ifconfig-pool-retain must be used with --ifconfig-pool or --ifconfig-ipv6-pool");
+        }
         if (options->ifconfig_ipv6_pool_defined && !options->ifconfig_ipv6_local)
         {
             msg(M_USAGE, "--ifconfig-ipv6-pool needs --ifconfig-ipv6");
@@ -1941,6 +1950,7 @@ options_postprocess_verify_ce(const struct options *options, const struct connec
          */
         MUST_BE_UNDEF(ifconfig_pool_defined, "ifconfig-pool");
         MUST_BE_UNDEF(ifconfig_pool_persist_filename, "ifconfig-pool-persist");
+        MUST_BE_UNDEF(ifconfig_pool_retain_seconds, "ifconfig-pool-retain");
         MUST_BE_UNDEF(ifconfig_ipv6_pool_defined, "ifconfig-ipv6-pool");
         MUST_BE_UNDEF(real_hash_size, "hash-size");
         MUST_BE_UNDEF(virtual_hash_size, "hash-size");
@@ -5773,6 +5783,15 @@ add_option(struct options *options, char *p[], bool is_inline, const char *file,
         if (p[2])
         {
             options->ifconfig_pool_persist_refresh_freq = positive_atoi(p[2], msglevel);
+        }
+    }
+    else if (streq(p[0], "ifconfig-pool-retain") && p[1] && !p[2])
+    {
+        VERIFY_PERMISSION(OPT_P_GENERAL);
+        if (!atoi_constrained(p[1], &options->ifconfig_pool_retain_seconds, p[0], 0, INT_MAX,
+                              msglevel))
+        {
+            goto err;
         }
     }
     else if (streq(p[0], "ifconfig-ipv6-pool") && p[1] && !p[2])

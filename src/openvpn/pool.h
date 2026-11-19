@@ -40,14 +40,18 @@ enum pool_type
 struct ifconfig_pool_entry
 {
     bool in_use;
+    bool retained;
     char *common_name;
     time_t last_release;
+    time_t retained_until;
+    uint64_t reconnect_count;
     bool fixed;
 };
 
 struct ifconfig_pool
 {
     bool duplicate_cn;
+    int retain_seconds;
     struct
     {
         bool enabled;
@@ -61,6 +65,20 @@ struct ifconfig_pool
     } ipv6;
     int size;
     struct ifconfig_pool_entry *list;
+    uint64_t expired_reclaims;
+    uint64_t lru_reclaims;
+    uint64_t total_reconnects;
+};
+
+struct ifconfig_pool_stats
+{
+    int total;
+    int assigned;
+    int retained;
+    int free;
+    uint64_t total_reconnects;
+    uint64_t expired_reclaims;
+    uint64_t lru_reclaims;
 };
 
 struct ifconfig_pool_persist
@@ -84,7 +102,26 @@ ifconfig_pool_handle ifconfig_pool_acquire(struct ifconfig_pool *pool, in_addr_t
                                            in_addr_t *remote, struct in6_addr *remote_ipv6,
                                            const char *common_name);
 
+ifconfig_pool_handle ifconfig_pool_acquire_ex(struct ifconfig_pool *pool, in_addr_t *local,
+                                              in_addr_t *remote, struct in6_addr *remote_ipv6,
+                                              const char *common_name, bool *reused,
+                                              uint64_t *reconnect_count);
+
 bool ifconfig_pool_release(struct ifconfig_pool *pool, ifconfig_pool_handle hand, const bool hard);
+
+void ifconfig_pool_set_retain(struct ifconfig_pool *pool, int retain_seconds);
+
+void ifconfig_pool_reap(struct ifconfig_pool *pool);
+
+int ifconfig_pool_release_by_cn(struct ifconfig_pool *pool, const char *common_name);
+
+void ifconfig_pool_get_stats(const struct ifconfig_pool *pool, struct ifconfig_pool_stats *stats);
+
+void ifconfig_pool_status(const struct ifconfig_pool *pool, struct status_output *out,
+                          const char sep);
+
+void ifconfig_pool_reconnect_status(const struct ifconfig_pool *pool,
+                                    struct status_output *out, const char sep);
 
 struct ifconfig_pool_persist *ifconfig_pool_persist_init(const char *filename, int refresh_freq);
 

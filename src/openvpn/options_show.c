@@ -164,6 +164,7 @@ show_p2mp_parms(const struct options *o)
         print_in_addr_t(o->ifconfig_pool_netmask, 0, &gc));
     SHOW_STR(ifconfig_pool_persist_filename);
     SHOW_INT(ifconfig_pool_persist_refresh_freq);
+    SHOW_INT(ifconfig_pool_retain_seconds);
     SHOW_BOOL(ifconfig_ipv6_pool_defined);
     msg(D_SHOW_PARMS, "  ifconfig_ipv6_pool_base = %s",
         print_in6_addr(o->ifconfig_ipv6_pool_base, 0, &gc));

@@ -17,6 +17,7 @@ test_binaries = argv_testdriver \
 	options_parse_testdriver \
 	packet_id_testdriver \
 	pkt_testdriver \
+	pool_testdriver \
 	provider_testdriver \
 	push_update_msg_testdriver \
 	socket_testdriver \
@@ -188,6 +189,19 @@ pkt_testdriver_SOURCES = test_pkt.c \
 	$(top_srcdir)/src/openvpn/ssl_pkt.c \
 	$(top_srcdir)/src/openvpn/win32-util.c \
 	$(top_srcdir)/src/openvpn/tls_crypt.c
+
+pool_testdriver_CFLAGS  = \
+	-I$(top_srcdir)/include -I$(top_srcdir)/src/compat -I$(top_srcdir)/src/openvpn \
+	@TEST_CFLAGS@
+pool_testdriver_LDFLAGS = @TEST_LDFLAGS@
+pool_testdriver_SOURCES = test_pool.c \
+	mock_msg.c mock_msg.h test_common.h \
+	mock_get_random.c \
+	$(top_srcdir)/src/compat/compat-strlcpy.c \
+	$(top_srcdir)/src/openvpn/buffer.c \
+	$(top_srcdir)/src/openvpn/otime.c \
+	$(top_srcdir)/src/openvpn/win32-util.c \
+	$(top_srcdir)/src/openvpn/platform.c
 
 if !WIN32
 tls_crypt_testdriver_CFLAGS  = \
